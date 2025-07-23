@@ -1,10 +1,10 @@
-# 🌐 Augment2Api Cloudflare 统一代理
+# 🌐 Augment2Api Cloudflare 多用户代理
 
-> **无服务器 • 全球分布 • 零维护**
+> **无服务器 • 全球分布 • 零维护 • 多用户管理**
 
-基于 Cloudflare Workers + D1 数据库的 Augment2Api 统一代理服务，完全无服务器部署。
+基于 Cloudflare Workers + D1 数据库的 Augment2Api 多用户统一代理服务，完全无服务器部署。
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/skymun016/augment2apicloudflare)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/amesky/augment2api-proxy)
 
 ## ✨ 特性
 
@@ -17,21 +17,42 @@
 
 ## 🎯 核心功能
 
+### 多用户Token池管理
+- 🏢 **企业级多用户系统**：支持用户注册、Token分配、配额管理
+- 🔄 **智能负载均衡**：自动选择最优Token，故障转移
+- 📊 **使用统计监控**：详细的用户使用统计和分析
+- 🔒 **权限管理**：细粒度的用户权限和Token访问控制
+
 ### 统一代理模式
-- 客户端使用统一的域名和 token
+- 客户端使用统一的域名和个人token
 - 系统内部管理多个真实 Augment token
 - 自动负载均衡和故障转移
 - 支持 OpenAI 兼容和 Augment 原生接口
 
 ### Web 管理界面
-- 直观的 token 管理界面
-- 实时状态监控
-- 使用统计查看
-- 安全的管理员认证
+- 🎛️ **管理员面板**：Token池管理、用户管理、系统配置
+- 👥 **用户管理**：用户注册、配额分配、使用监控
+- 📈 **实时监控**：Token状态、使用统计、性能指标
+- 🔐 **安全认证**：管理员和用户双重认证体系
 
 ## 🚀 快速部署
 
-### 方法1: 一键部署（推荐）
+### 方法1: GitHub一键部署（推荐）
+
+1. **Fork本仓库**到您的GitHub账号
+2. **登录Cloudflare控制台**
+3. **进入Workers & Pages** → **Create application** → **Pages** → **Connect to Git**
+4. **选择您fork的仓库**
+5. **配置构建设置**：
+   ```
+   Framework preset: None
+   Build command: npm install
+   Build output directory: /
+   Root directory: /
+   ```
+6. **点击Deploy**
+
+### 方法2: 自动化脚本部署
 
 1. **Fork 此仓库**
 2. **在 Cloudflare 中连接 GitHub**
@@ -52,12 +73,24 @@
    ACCESS_PWD=your-admin-password
    ```
 
-### 方法2: 本地部署
+```bash
+# 登录 Cloudflare
+npx wrangler login
+
+# 一键部署（开发环境）
+chmod +x deploy-multiuser.sh
+./deploy-multiuser.sh dev
+
+# 生产环境部署
+./deploy-multiuser.sh production
+```
+
+### 方法3: 手动部署
 
 ```bash
 # 克隆仓库
-git clone https://github.com/skymun016/augment2apicloudflare.git
-cd augment2apicloudflare
+git clone https://github.com/amesky/augment2api-proxy.git
+cd augment2api-proxy
 
 # 安装依赖
 npm install
@@ -66,12 +99,12 @@ npm install
 npx wrangler login
 
 # 创建 D1 数据库
-npx wrangler d1 create augment2api-db
+npx wrangler d1 create augment2api-multiuser
 
 # 更新 wrangler.toml 中的 database_id
 
 # 初始化数据库
-npx wrangler d1 execute augment2api-db --file=./schema.sql
+npx wrangler d1 execute augment2api-multiuser --file=./schema-extended.sql
 
 # 部署
 npx wrangler deploy

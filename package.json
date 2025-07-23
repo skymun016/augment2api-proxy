@@ -36,7 +36,7 @@
   },
   "homepage": "https://github.com/skymun016/augment2apicloudflare#readme",
   "devDependencies": {
-    "wrangler": "^3.0.0"
+    "wrangler": "^3.114.11"
   },
   "engines": {
     "node": ">=16.0.0"

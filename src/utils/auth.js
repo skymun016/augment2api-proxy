@@ -86,14 +86,29 @@ export async function verifyUserAuth(request, env) {
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return { success: false, error: 'Missing authorization header' };
   }
-  
+
   const token = authHeader.substring(7);
-  
+
+  // 检查是否是UNIFIED_TOKEN（兼容模式）
+  if (token === env.UNIFIED_TOKEN) {
+    return {
+      success: true,
+      user: {
+        id: 'unified-user',
+        username: 'Unified User',
+        email: 'unified@augment2api.com',
+        token_quota: 999,
+        status: 'active'
+      },
+      isUnifiedToken: true
+    };
+  }
+
   // 首先尝试作为Personal Token验证
   const user = await getUserByPersonalToken(env.DB, token);
   if (user) {
-    return { 
-      success: true, 
+    return {
+      success: true,
       user: {
         id: user.id,
         username: user.username,

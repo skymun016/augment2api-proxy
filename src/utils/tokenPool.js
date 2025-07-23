@@ -6,18 +6,31 @@
  * @param {number} userId - 用户ID
  * @returns {Array} Token列表
  */
-export async function getAvailableTokensForUser(db, userId) {
+export async function getAvailableTokensForUser(db, userId, isUnifiedToken = false) {
   try {
-    const tokens = await db.prepare(`
-      SELECT t.*, uta.priority, uta.allocated_at
-      FROM tokens t
-      JOIN user_token_allocations uta ON t.id = uta.token_id
-      WHERE uta.user_id = ? 
-        AND uta.status = 'active'
-        AND t.status = 'active'
-      ORDER BY uta.priority ASC, t.usage_count ASC, uta.allocated_at ASC
-    `).bind(userId).all();
-    
+    let tokens;
+
+    if (isUnifiedToken) {
+      // UNIFIED_TOKEN用户可以访问所有活跃的token
+      tokens = await db.prepare(`
+        SELECT t.*, CURRENT_TIMESTAMP as allocated_at
+        FROM tokens t
+        WHERE t.status = 'active'
+        ORDER BY t.usage_count ASC, t.created_at ASC
+      `).all();
+    } else {
+      // 普通用户只能访问分配给他们的token
+      tokens = await db.prepare(`
+        SELECT t.*, ta.created_at as allocated_at
+        FROM tokens t
+        JOIN token_allocations ta ON t.id = ta.token_id
+        WHERE ta.user_id = ?
+          AND ta.status = 'active'
+          AND t.status = 'active'
+        ORDER BY t.usage_count ASC, ta.created_at ASC
+      `).bind(userId).all();
+    }
+
     return tokens.results || [];
   } catch (error) {
     console.error('Error getting available tokens for user:', error);
@@ -29,15 +42,16 @@ export async function getAvailableTokensForUser(db, userId) {
  * 为用户选择最优Token
  * @param {Object} db - 数据库连接
  * @param {number} userId - 用户ID
+ * @param {boolean} isUnifiedToken - 是否是UNIFIED_TOKEN用户
  * @returns {Object|null} 最优Token或null
  */
-export async function selectOptimalToken(db, userId) {
-  const availableTokens = await getAvailableTokensForUser(db, userId);
-  
+export async function selectOptimalToken(db, userId, isUnifiedToken = false) {
+  const availableTokens = await getAvailableTokensForUser(db, userId, isUnifiedToken);
+
   if (availableTokens.length === 0) {
     return null;
   }
-  
+
   // 选择策略：
   // 1. 优先级最高（数字最小）
   // 2. 使用次数最少

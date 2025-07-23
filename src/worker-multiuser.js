@@ -2,7 +2,7 @@
 // 支持用户注册、Token分配、使用统计等完整功能
 
 import { generateHash, verifyHash } from './utils/crypto.js';
-import { validatePersonalToken, getUserByPersonalToken, verifyAdminAuth } from './utils/auth.js';
+import { validatePersonalToken, getUserByPersonalToken, verifyAdminAuth, verifyUserAuth } from './utils/auth.js';
 import { getAvailableTokensForUser, selectOptimalToken, updateTokenUsage } from './utils/tokenPool.js';
 import { logUserActivity, getUserUsageStats } from './utils/analytics.js';
 import { jsonResponse, handleCORS, createApiResponse } from './utils/common.js';
@@ -104,6 +104,15 @@ export default {
       else if (path === '/api/admin/tokens' && method === 'POST') {
         return handleAdminCreateToken(request, env);
       }
+      else if (path.startsWith('/api/admin/tokens/') && method === 'GET') {
+        return handleAdminGetToken(request, env);
+      }
+      else if (path.startsWith('/api/admin/tokens/') && method === 'PUT') {
+        return handleAdminUpdateToken(request, env);
+      }
+      else if (path.startsWith('/api/admin/tokens/') && method === 'DELETE') {
+        return handleAdminDeleteToken(request, env);
+      }
       else if (path === '/api/admin/allocations' && method === 'GET') {
         return handleAdminGetAllocations(request, env);
       }
@@ -125,6 +134,16 @@ export default {
         return handleChatCompletion(request, env);
       }
       
+      // Augment认证代理 - 混合认证方式
+      else if (path === '/v1/auth' && method === 'POST') {
+        return handleAugmentAuthProxy(request, env);
+      }
+
+      // Augment认证测试接口
+      else if (path === '/v1/auth' && method === 'POST') {
+        return handleAugmentAuthTest(request, env);
+      }
+
       // 健康检查
       else if (path === '/health') {
         return handleHealthCheck(request, env);
@@ -249,20 +268,35 @@ async function handlePluginTokens(request, env) {
     return jsonResponse({ error: 'Missing or invalid authorization header' }, 401);
   }
 
-  const personalToken = authHeader.substring(7);
+  const token = authHeader.substring(7);
 
   try {
-    const user = await getUserByPersonalToken(env.DB, personalToken);
-    if (!user) {
-      return jsonResponse({ error: 'Invalid personal token' }, 401);
+    // 检查是否是UNIFIED_TOKEN
+    let user, isUnifiedToken = false;
+
+    if (token === env.UNIFIED_TOKEN) {
+      // UNIFIED_TOKEN用户
+      user = {
+        id: 'unified-user',
+        username: 'Unified User',
+        email: 'unified@augment2api.com'
+      };
+      isUnifiedToken = true;
+    } else {
+      // 普通用户
+      user = await getUserByPersonalToken(env.DB, token);
+      if (!user) {
+        return jsonResponse({ error: 'Invalid personal token' }, 401);
+      }
     }
 
     // 获取用户可用的Token列表
-    const availableTokens = await getAvailableTokensForUser(env.DB, user.id);
+    const availableTokens = await getAvailableTokensForUser(env.DB, user.id, isUnifiedToken);
 
     // 转换为插件期望的格式
     const tokenList = availableTokens.map(token => ({
-      token: token.token_value, // 插件期望的实际token值
+      token: token.token || token.token_prefix + '...', // 如果有实际token则使用，否则使用前缀
+      tenant_url: token.tenant_url || 'https://api.augmentcode.com', // 包含租户URL
       usage_count: token.usage_count || 0,
       last_used: token.last_used_at,
       status: 'active'
@@ -321,6 +355,140 @@ async function handleUserRegister(request, env) {
   } catch (error) {
     console.error('Error in handleUserRegister:', error);
     return jsonResponse({ error: 'Registration failed' }, 500);
+  }
+}
+
+// 处理用户登录
+async function handleUserLogin(request, env) {
+  try {
+    const { personal_token } = await request.json();
+
+    if (!personal_token) {
+      return jsonResponse({ error: 'Missing personal_token' }, 400);
+    }
+
+    // 检查是否是UNIFIED_TOKEN
+    let user;
+    if (personal_token === env.UNIFIED_TOKEN) {
+      // UNIFIED_TOKEN用户
+      user = {
+        id: 'unified-user',
+        username: 'Unified User',
+        email: 'unified@augment2api.com',
+        token_quota: 999,
+        status: 'active'
+      };
+    } else {
+      // 查询普通用户
+      user = await env.DB.prepare(`
+        SELECT * FROM users WHERE personal_token = ? AND status = 'active'
+      `).bind(personal_token).first();
+
+      if (!user) {
+        return jsonResponse({ error: 'Invalid token or user not found' }, 401);
+      }
+    }
+
+    // 生成会话token
+    const sessionToken = generateRandomToken();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24小时后过期
+
+    // 保存会话（UNIFIED_TOKEN用户跳过数据库保存）
+    if (personal_token !== env.UNIFIED_TOKEN) {
+      await env.DB.prepare(`
+        INSERT INTO sessions (session_token, user_id, expires_at)
+        VALUES (?, ?, ?)
+      `).bind(sessionToken, user.id, expiresAt.toISOString()).run();
+    }
+
+    return jsonResponse({
+      status: 'success',
+      session_token: sessionToken,
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        token_quota: user.token_quota,
+        status: user.status
+      },
+      expires_at: expiresAt.toISOString()
+    });
+
+  } catch (error) {
+    console.error('Error in handleUserLogin:', error);
+    return jsonResponse({ error: 'Login failed' }, 500);
+  }
+}
+
+// 处理用户资料查询
+async function handleUserProfile(request, env) {
+  try {
+    const authResult = await verifyUserAuth(request, env);
+    if (!authResult.success) {
+      return jsonResponse({ error: authResult.error }, 401);
+    }
+
+    const user = authResult.user;
+
+    // 获取用户的token分配信息
+    const allocations = await env.DB.prepare(`
+      SELECT t.name, t.token_prefix, ta.status, ta.created_at
+      FROM token_allocations ta
+      JOIN tokens t ON ta.token_id = t.id
+      WHERE ta.user_id = ? AND ta.status = 'active'
+    `).bind(user.id).all();
+
+    return jsonResponse({
+      status: 'success',
+      user: {
+        id: user.id,
+        username: user.username,
+        email: user.email,
+        token_quota: user.token_quota,
+        status: user.status,
+        created_at: user.created_at
+      },
+      allocated_tokens: allocations.results || []
+    });
+
+  } catch (error) {
+    console.error('Error in handleUserProfile:', error);
+    return jsonResponse({ error: 'Failed to get user profile' }, 500);
+  }
+}
+
+// 处理用户使用统计查询
+async function handleUserUsage(request, env) {
+  try {
+    const authResult = await verifyUserAuth(request, env);
+    if (!authResult.success) {
+      return jsonResponse({ error: authResult.error }, 401);
+    }
+
+    const user = authResult.user;
+
+    // 获取使用统计
+    const stats = await env.DB.prepare(`
+      SELECT
+        COUNT(*) as total_requests,
+        SUM(success_count) as successful_requests,
+        SUM(error_count) as failed_requests,
+        DATE(created_at) as date
+      FROM usage_logs
+      WHERE user_id = ?
+      GROUP BY DATE(created_at)
+      ORDER BY date DESC
+      LIMIT 30
+    `).bind(user.id).all();
+
+    return jsonResponse({
+      status: 'success',
+      usage_stats: stats.results || []
+    });
+
+  } catch (error) {
+    console.error('Error in handleUserUsage:', error);
+    return jsonResponse({ error: 'Failed to get usage stats' }, 500);
   }
 }
 
@@ -637,7 +805,7 @@ async function handleAdminGetTokens(request, env) {
     let tokens = { results: [] };
     try {
       tokens = await env.DB.prepare(`
-        SELECT id, name, token_prefix, status, created_at, updated_at
+        SELECT id, name, token_prefix, tenant_url, remark, status, created_at, updated_at
         FROM tokens
         ORDER BY created_at DESC
       `).all();
@@ -666,10 +834,10 @@ async function handleAdminCreateToken(request, env) {
       return jsonResponse({ error: authResult.error }, 401);
     }
 
-    const { name, token } = await request.json();
+    const { name, token, tenant_url, remark } = await request.json();
 
-    if (!name || !token) {
-      return jsonResponse({ error: 'Missing name or token' }, 400);
+    if (!name || !token || !tenant_url) {
+      return jsonResponse({ error: 'Missing name, token, or tenant_url' }, 400);
     }
 
     // 验证token格式（应该是64位十六进制）
@@ -698,9 +866,9 @@ async function handleAdminCreateToken(request, env) {
     let result;
     try {
       result = await env.DB.prepare(`
-        INSERT INTO tokens (name, token_hash, token_prefix, status)
-        VALUES (?, ?, ?, 'active')
-      `).bind(name, tokenHash, tokenPrefix).run();
+        INSERT INTO tokens (name, token, token_hash, token_prefix, tenant_url, remark, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'active')
+      `).bind(name, token, tokenHash, tokenPrefix, tenant_url, remark || '').run();
     } catch (dbError) {
       console.error('Failed to insert token, table may not exist:', dbError.message);
       return jsonResponse({
@@ -721,7 +889,150 @@ async function handleAdminCreateToken(request, env) {
   }
 }
 
+// 处理管理员获取单个Token
+async function handleAdminGetToken(request, env) {
+  try {
+    // 验证管理员权限
+    const authResult = await verifyAdminAuth(request, env);
+    if (!authResult.success) {
+      return jsonResponse({ error: authResult.error }, 401);
+    }
 
+    const url = new URL(request.url);
+    const tokenId = url.pathname.split('/').pop();
+
+    const token = await env.DB.prepare(`
+      SELECT id, name, token, tenant_url, status, remark, usage_count, last_used_at, created_at, updated_at
+      FROM tokens
+      WHERE id = ?
+    `).bind(tokenId).first();
+
+    if (!token) {
+      return jsonResponse({ error: 'Token not found' }, 404);
+    }
+
+    return jsonResponse({
+      status: 'success',
+      ...token
+    });
+
+  } catch (error) {
+    console.error('Error in handleAdminGetToken:', error);
+    return jsonResponse({ error: 'Failed to get token' }, 500);
+  }
+}
+
+// 处理管理员更新Token
+async function handleAdminUpdateToken(request, env) {
+  try {
+    // 验证管理员权限
+    const authResult = await verifyAdminAuth(request, env);
+    if (!authResult.success) {
+      return jsonResponse({ error: authResult.error }, 401);
+    }
+
+    const url = new URL(request.url);
+    const tokenId = url.pathname.split('/').pop();
+    const { name, token, tenant_url, remark, status } = await request.json();
+
+    // 检查Token是否存在
+    const existingToken = await env.DB.prepare('SELECT id FROM tokens WHERE id = ?').bind(tokenId).first();
+    if (!existingToken) {
+      return jsonResponse({ error: 'Token not found' }, 404);
+    }
+
+    // 构建更新语句
+    const updates = [];
+    const values = [];
+
+    if (name) {
+      updates.push('name = ?');
+      values.push(name);
+    }
+    if (token) {
+      // 验证token格式（应该是64位十六进制）
+      if (!/^[a-fA-F0-9]{64}$/.test(token)) {
+        return jsonResponse({ error: 'Invalid token format. Must be 64-character hex string.' }, 400);
+      }
+      updates.push('token = ?');
+      values.push(token);
+      // 更新token前缀
+      updates.push('token_prefix = ?');
+      values.push(token.substring(0, 8) + '...');
+    }
+    if (tenant_url) {
+      updates.push('tenant_url = ?');
+      values.push(tenant_url);
+    }
+    if (remark !== undefined) {
+      updates.push('remark = ?');
+      values.push(remark);
+    }
+    if (status) {
+      updates.push('status = ?');
+      values.push(status);
+    }
+
+    if (updates.length === 0) {
+      return jsonResponse({ error: 'No fields to update' }, 400);
+    }
+
+    values.push(tokenId);
+
+    await env.DB.prepare(`
+      UPDATE tokens SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).bind(...values).run();
+
+    return jsonResponse({
+      status: 'success',
+      message: 'Token updated successfully'
+    });
+
+  } catch (error) {
+    console.error('Error in handleAdminUpdateToken:', error);
+    return jsonResponse({ error: 'Failed to update token' }, 500);
+  }
+}
+
+// 处理管理员删除Token
+async function handleAdminDeleteToken(request, env) {
+  try {
+    // 验证管理员权限
+    const authResult = await verifyAdminAuth(request, env);
+    if (!authResult.success) {
+      return jsonResponse({ error: authResult.error }, 401);
+    }
+
+    const url = new URL(request.url);
+    const tokenId = url.pathname.split('/').pop();
+
+    // 检查Token是否存在
+    const token = await env.DB.prepare('SELECT id FROM tokens WHERE id = ?').bind(tokenId).first();
+    if (!token) {
+      return jsonResponse({ error: 'Token not found' }, 404);
+    }
+
+    // 先删除相关的分配记录
+    try {
+      await env.DB.prepare('DELETE FROM user_token_allocations WHERE token_id = ?').bind(tokenId).run();
+    } catch (e) {
+      console.log('No allocations to delete or table does not exist:', e.message);
+    }
+
+    // 删除Token
+    await env.DB.prepare('DELETE FROM tokens WHERE id = ?').bind(tokenId).run();
+
+    return jsonResponse({
+      status: 'success',
+      message: 'Token deleted successfully'
+    });
+
+  } catch (error) {
+    console.error('Error in handleAdminDeleteToken:', error);
+    return jsonResponse({ error: 'Failed to delete token' }, 500);
+  }
+}
 
 // 处理管理员创建用户
 async function handleAdminCreateUser(request, env) {
@@ -787,7 +1098,7 @@ async function handleAdminUpdateUser(request, env) {
 
     const url = new URL(request.url);
     const userId = url.pathname.split('/').pop();
-    const { username, email, token_quota, status } = await request.json();
+    const { username, email, personal_token, token_quota, status } = await request.json();
 
     // 检查用户是否存在
     const user = await env.DB.prepare('SELECT id FROM users WHERE id = ?').bind(userId).first();
@@ -806,6 +1117,10 @@ async function handleAdminUpdateUser(request, env) {
     if (email) {
       updates.push('email = ?');
       values.push(email);
+    }
+    if (personal_token) {
+      updates.push('personal_token = ?');
+      values.push(personal_token);
     }
     if (token_quota !== undefined) {
       updates.push('token_quota = ?');
@@ -851,14 +1166,14 @@ async function handleAdminDeleteAllocation(request, env) {
     const allocationId = url.pathname.split('/').pop();
 
     // 检查分配是否存在
-    const allocation = await env.DB.prepare('SELECT id FROM token_allocations WHERE id = ?').bind(allocationId).first();
+    const allocation = await env.DB.prepare('SELECT id FROM user_token_allocations WHERE id = ?').bind(allocationId).first();
     if (!allocation) {
       return jsonResponse({ error: 'Allocation not found' }, 404);
     }
 
     // 删除分配（软删除）
     await env.DB.prepare(`
-      UPDATE token_allocations SET status = 'deleted', updated_at = CURRENT_TIMESTAMP
+      UPDATE user_token_allocations SET status = 'revoked', updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `).bind(allocationId).run();
 
@@ -890,16 +1205,16 @@ async function handleAdminGetAllocations(request, env) {
           ta.user_id,
           ta.token_id,
           ta.status,
-          ta.created_at,
+          ta.allocated_at as created_at,
           u.username,
           u.email,
           t.name as token_name,
           t.token_prefix
-        FROM token_allocations ta
+        FROM user_token_allocations ta
         JOIN users u ON ta.user_id = u.id
         JOIN tokens t ON ta.token_id = t.id
         WHERE ta.status = 'active'
-        ORDER BY ta.created_at DESC
+        ORDER BY ta.allocated_at DESC
       `).all();
     } catch (dbError) {
       console.log('Allocations query failed (tables may not exist):', dbError.message);
@@ -944,16 +1259,30 @@ async function handleChatCompletion(request, env) {
     return jsonResponse({ error: 'Missing authorization header' }, 401);
   }
 
-  const personalToken = authHeader.substring(7);
+  const token = authHeader.substring(7);
 
   try {
-    const user = await getUserByPersonalToken(env.DB, personalToken);
-    if (!user) {
-      return jsonResponse({ error: 'Invalid personal token' }, 401);
+    // 检查是否是UNIFIED_TOKEN
+    let user, isUnifiedToken = false;
+
+    if (token === env.UNIFIED_TOKEN) {
+      // UNIFIED_TOKEN用户
+      user = {
+        id: 'unified-user',
+        username: 'Unified User',
+        email: 'unified@augment2api.com'
+      };
+      isUnifiedToken = true;
+    } else {
+      // 普通用户
+      user = await getUserByPersonalToken(env.DB, token);
+      if (!user) {
+        return jsonResponse({ error: 'Invalid personal token' }, 401);
+      }
     }
 
     // 获取用户的最优Token
-    const optimalToken = await selectOptimalToken(env.DB, user.id);
+    const optimalToken = await selectOptimalToken(env.DB, user.id, isUnifiedToken);
     if (!optimalToken) {
       return jsonResponse({ error: 'No available tokens' }, 503);
     }
@@ -985,6 +1314,13 @@ async function handleChatCompletion(request, env) {
 }
 
 // ============ 辅助函数 ============
+
+// 生成随机Token
+function generateRandomToken() {
+  const array = new Uint8Array(32);
+  crypto.getRandomValues(array);
+  return Array.from(array, byte => byte.toString(16).padStart(2, '0')).join('');
+}
 
 // 转发请求到Augment API
 async function forwardToAugment(token, requestBody, env) {
@@ -1833,6 +2169,94 @@ async function handleAdminPanel(request, env) {
             });
         }
 
+        // 编辑用户模态框
+        async function editUser(userId) {
+            try {
+                // 获取用户详细信息
+                const users = await apiRequest('/api/admin/users');
+                const user = users.users.find(u => u.id === userId);
+
+                if (!user) {
+                    alert('用户不存在');
+                    return;
+                }
+
+                const content = \`
+                    <div class="edit-user-modal">
+                        <h3 style="margin-bottom: 20px; color: #333; font-size: 18px;">编辑用户</h3>
+                        <form id="editUserForm">
+                            <input type="hidden" name="user_id" value="\${user.id}">
+                            <div class="form-group" style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 5px; font-weight: 500; color: #555;">用户名</label>
+                                <input type="text" name="username" value="\${user.username || ''}" required
+                                       style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                            </div>
+                            <div class="form-group" style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 5px; font-weight: 500; color: #555;">邮箱</label>
+                                <input type="email" name="email" value="\${user.email || ''}" required
+                                       style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                            </div>
+                            <div class="form-group" style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 5px; font-weight: 500; color: #555;">Personal Token</label>
+                                <input type="text" name="personal_token" value="\${user.personal_token || ''}" required
+                                       placeholder="64位十六进制字符串" maxlength="64"
+                                       style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-family: monospace;">
+                                <small style="color: #666; font-size: 12px;">用于API认证的个人Token</small>
+                            </div>
+                            <div class="form-group" style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 5px; font-weight: 500; color: #555;">Token配额</label>
+                                <input type="number" name="token_quota" value="\${user.token_quota || 3}" min="0" max="10"
+                                       style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                                <small style="color: #666; font-size: 12px;">用户可以使用的最大Token数量</small>
+                            </div>
+                            <div class="form-group" style="margin-bottom: 20px;">
+                                <label style="display: block; margin-bottom: 5px; font-weight: 500; color: #555;">状态</label>
+                                <select name="status" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                                    <option value="active" \${user.status === 'active' ? 'selected' : ''}>活跃</option>
+                                    <option value="inactive" \${user.status === 'inactive' ? 'selected' : ''}>禁用</option>
+                                </select>
+                            </div>
+                            <div style="text-align: right; padding-top: 15px; border-top: 1px solid #e9ecef;">
+                                <button type="button" onclick="closeModal()"
+                                        style="background: #6c757d; color: white; border: none; padding: 8px 16px; border-radius: 4px; margin-right: 10px; cursor: pointer;">取消</button>
+                                <button type="submit"
+                                        style="background: #007bff; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer;">保存修改</button>
+                            </div>
+                        </form>
+                    </div>
+                \`;
+
+                showModal(content);
+
+                document.getElementById('editUserForm').addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const formData = new FormData(e.target);
+                    const userData = Object.fromEntries(formData);
+
+                    try {
+                        const result = await apiRequest(\`/api/admin/users/\${userId}\`, {
+                            method: 'PUT',
+                            body: JSON.stringify(userData)
+                        });
+
+                        if (result.status === 'success') {
+                            closeModal();
+                            loadUsers();
+                            alert('用户信息更新成功');
+                        } else {
+                            alert('更新失败: ' + result.error);
+                        }
+                    } catch (error) {
+                        alert('更新失败: ' + error.message);
+                    }
+                });
+
+            } catch (error) {
+                console.error('获取用户信息失败:', error);
+                alert('获取用户信息失败: ' + error.message);
+            }
+        }
+
         // 创建Token模态框
         function showCreateTokenModal() {
             const content = \`
@@ -1846,6 +2270,15 @@ async function handleAdminPanel(request, env) {
                         <label>Augment Token</label>
                         <input type="text" name="token" required placeholder="64位十六进制字符串" maxlength="64">
                         <small style="color: #666;">请输入完整的64位Augment Token</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Tenant URL</label>
+                        <input type="url" name="tenant_url" required placeholder="https://xxx.augmentcode.com">
+                        <small style="color: #666;">请输入完整的Tenant URL</small>
+                    </div>
+                    <div class="form-group">
+                        <label>备注</label>
+                        <input type="text" name="remark" placeholder="可选备注信息">
                     </div>
                     <button type="submit" class="btn btn-primary">添加Token</button>
                 </form>
@@ -1879,22 +2312,50 @@ async function handleAdminPanel(request, env) {
         // 创建批量分配模态框
         function showCreateAllocationModal() {
             const content = \`
-                <h3>批量分配Token</h3>
-                <form id="createAllocationForm">
-                    <div class="form-group">
-                        <label>选择用户</label>
-                        <select name="user_id" id="userSelect" required>
-                            <option value="">请选择用户</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>选择Token（可多选）</label>
-                        <div id="tokenCheckboxes" style="max-height: 200px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; border-radius: 4px;">
-                            <div class="loading">加载中...</div>
+                <div class="allocation-modal">
+                    <h3 style="margin-bottom: 20px; color: #333; font-size: 18px;">批量分配Token</h3>
+                    <form id="createAllocationForm">
+                        <div class="form-group" style="margin-bottom: 20px;">
+                            <label style="display: block; margin-bottom: 8px; font-weight: 500; color: #555;">选择用户</label>
+                            <select name="user_id" id="userSelect" required style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px;">
+                                <option value="">请选择用户</option>
+                            </select>
                         </div>
-                    </div>
-                    <button type="submit" class="btn btn-primary">批量分配</button>
-                </form>
+                        <div class="form-group" style="margin-bottom: 25px;">
+                            <label style="display: block; margin-bottom: 12px; font-weight: 500; color: #555;">选择Token（可多选）</label>
+                            <div class="token-selection-header" style="margin-bottom: 10px;">
+                                <button type="button" id="selectAllTokens" style="background: #f8f9fa; border: 1px solid #dee2e6; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; margin-right: 8px;">全选</button>
+                                <button type="button" id="clearAllTokens" style="background: #f8f9fa; border: 1px solid #dee2e6; padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer;">清空</button>
+                            </div>
+                            <div id="tokenCheckboxes" style="max-height: 280px; overflow-y: auto; border: 1px solid #e1e5e9; padding: 15px; border-radius: 8px; background: #fafbfc;">
+                                <div class="loading" style="text-align: center; color: #6c757d; padding: 20px;">
+                                    <div style="display: inline-block; width: 16px; height: 16px; border: 2px solid #f3f3f3; border-top: 2px solid #007bff; border-radius: 50%; animation: spin 1s linear infinite; margin-right: 8px;"></div>
+                                    加载中...
+                                </div>
+                            </div>
+                        </div>
+                        <div style="text-align: right; padding-top: 15px; border-top: 1px solid #e9ecef;">
+                            <button type="button" onclick="closeModal()" style="background: #6c757d; color: white; border: none; padding: 10px 20px; border-radius: 6px; margin-right: 10px; cursor: pointer;">取消</button>
+                            <button type="submit" class="btn btn-primary" style="background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer;">批量分配</button>
+                        </div>
+                    </form>
+                </div>
+                <style>
+                    @keyframes spin {
+                        0% { transform: rotate(0deg); }
+                        100% { transform: rotate(360deg); }
+                    }
+                    .token-item {
+                        transition: background-color 0.2s ease;
+                    }
+                    .token-item:hover {
+                        background-color: #f1f3f4 !important;
+                    }
+                    .btn:hover {
+                        opacity: 0.9;
+                        transform: translateY(-1px);
+                    }
+                </style>
             \`;
             showModal(content);
 
@@ -1902,6 +2363,17 @@ async function handleAdminPanel(request, env) {
             loadUsersForSelect();
             // 加载Token列表
             loadTokensForSelect();
+
+            // 添加全选和清空按钮事件监听器
+            document.getElementById('selectAllTokens').addEventListener('click', () => {
+                const checkboxes = document.querySelectorAll('input[name="token_ids"]');
+                checkboxes.forEach(cb => cb.checked = true);
+            });
+
+            document.getElementById('clearAllTokens').addEventListener('click', () => {
+                const checkboxes = document.querySelectorAll('input[name="token_ids"]');
+                checkboxes.forEach(cb => cb.checked = false);
+            });
 
             document.getElementById('createAllocationForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
@@ -1967,23 +2439,76 @@ async function handleAdminPanel(request, env) {
                 container.innerHTML = '';
 
                 if (tokens.tokens && tokens.tokens.length > 0) {
-                    tokens.tokens.forEach(token => {
+                    tokens.tokens.forEach((token, index) => {
                         const div = document.createElement('div');
-                        div.style.marginBottom = '8px';
+                        div.className = 'token-item';
+                        div.style.cssText = \`
+                            margin-bottom: 6px;
+                            padding: 12px;
+                            border: 1px solid #e9ecef;
+                            border-radius: 6px;
+                            background: white;
+                            transition: all 0.2s ease;
+                            cursor: pointer;
+                        \`;
+
                         div.innerHTML = \`
-                            <label style="display: flex; align-items: center; cursor: pointer;">
-                                <input type="checkbox" name="token_ids" value="\${token.id}" style="margin-right: 8px;">
-                                <span>\${token.name} (\${token.token_prefix})</span>
+                            <label style="display: flex; align-items: center; cursor: pointer; margin: 0;">
+                                <input type="checkbox" name="token_ids" value="\${token.id}"
+                                       style="margin-right: 12px; width: 16px; height: 16px; cursor: pointer;">
+                                <div style="flex: 1;">
+                                    <div style="font-weight: 500; color: #333; margin-bottom: 4px; font-size: 14px;">
+                                        \${token.name}
+                                    </div>
+                                    <div style="color: #6c757d; font-size: 12px; font-family: monospace;">
+                                        \${token.token_prefix}
+                                    </div>
+                                </div>
+                                <div style="color: \${token.status === 'active' ? '#28a745' : '#dc3545'}; font-size: 12px; font-weight: 500;">
+                                    \${token.status === 'active' ? '活跃' : '禁用'}
+                                </div>
                             </label>
                         \`;
+
+                        // 添加悬停效果
+                        div.addEventListener('mouseenter', () => {
+                            div.style.borderColor = '#007bff';
+                            div.style.boxShadow = '0 2px 4px rgba(0,123,255,0.1)';
+                        });
+
+                        div.addEventListener('mouseleave', () => {
+                            div.style.borderColor = '#e9ecef';
+                            div.style.boxShadow = 'none';
+                        });
+
+                        // 点击整个div来切换复选框
+                        div.addEventListener('click', (e) => {
+                            if (e.target.type !== 'checkbox') {
+                                const checkbox = div.querySelector('input[type="checkbox"]');
+                                checkbox.checked = !checkbox.checked;
+                            }
+                        });
+
                         container.appendChild(div);
                     });
                 } else {
-                    container.innerHTML = '<p style="color: #666;">暂无可用Token</p>';
+                    container.innerHTML = \`
+                        <div style="text-align: center; padding: 40px; color: #6c757d;">
+                            <div style="font-size: 48px; margin-bottom: 16px;">📝</div>
+                            <div style="font-size: 14px;">暂无可用Token</div>
+                            <div style="font-size: 12px; margin-top: 8px;">请先添加Token后再进行分配</div>
+                        </div>
+                    \`;
                 }
             } catch (error) {
                 console.error('加载Token列表失败:', error);
-                document.getElementById('tokenCheckboxes').innerHTML = '<p style="color: #c33;">加载失败</p>';
+                document.getElementById('tokenCheckboxes').innerHTML = \`
+                    <div style="text-align: center; padding: 40px; color: #dc3545;">
+                        <div style="font-size: 48px; margin-bottom: 16px;">⚠️</div>
+                        <div style="font-size: 14px;">加载失败</div>
+                        <div style="font-size: 12px; margin-top: 8px;">请检查网络连接或刷新页面重试</div>
+                    </div>
+                \`;
             }
         }
 
@@ -1998,6 +2523,7 @@ async function handleAdminPanel(request, env) {
                                 <th>ID</th>
                                 <th>名称</th>
                                 <th>Token前缀</th>
+                                <th>Tenant URL</th>
                                 <th>状态</th>
                                 <th>创建时间</th>
                                 <th>操作</th>
@@ -2009,19 +2535,112 @@ async function handleAdminPanel(request, env) {
                                     <td>\${token.id}</td>
                                     <td>\${token.name}</td>
                                     <td>\${token.token_prefix}</td>
+                                    <td>\${token.tenant_url || '未设置'}</td>
                                     <td>\${token.status}</td>
                                     <td>\${new Date(token.created_at).toLocaleString()}</td>
                                     <td>
                                         <button class="btn btn-secondary" onclick="editToken(\${token.id})">编辑</button>
+                                        <button class="btn btn-danger" onclick="deleteToken(\${token.id})" style="margin-left: 5px;">删除</button>
                                     </td>
                                 </tr>
-                            \`).join('') : '<tr><td colspan="6">暂无数据</td></tr>'}
+                            \`).join('') : '<tr><td colspan="7">暂无数据</td></tr>'}
                         </tbody>
                     </table>
                 \`;
                 document.getElementById('tokensTable').innerHTML = tableHtml;
             } catch (error) {
                 document.getElementById('tokensTable').innerHTML = '<div class="error">加载Token列表失败</div>';
+            }
+        }
+
+        // 编辑Token
+        async function editToken(tokenId) {
+            try {
+                // 获取Token详细信息
+                const token = await apiRequest(\`/api/admin/tokens/\${tokenId}\`);
+
+                const content = \`
+                    <h3>编辑Token</h3>
+                    <form id="editTokenForm">
+                        <div class="form-group">
+                            <label>Token名称</label>
+                            <input type="text" name="name" required value="\${token.name || ''}" placeholder="例如：Token-001">
+                        </div>
+                        <div class="form-group">
+                            <label>Augment Token</label>
+                            <input type="text" name="token" required value="\${token.token || ''}" placeholder="64位十六进制字符串" maxlength="64">
+                            <small style="color: #666;">请输入完整的64位Augment Token</small>
+                        </div>
+                        <div class="form-group">
+                            <label>Tenant URL</label>
+                            <input type="url" name="tenant_url" required value="\${token.tenant_url || ''}" placeholder="https://xxx.augmentcode.com">
+                            <small style="color: #666;">请输入完整的Tenant URL</small>
+                        </div>
+                        <div class="form-group">
+                            <label>备注</label>
+                            <input type="text" name="remark" value="\${token.remark || ''}" placeholder="可选备注信息">
+                        </div>
+                        <div class="form-group">
+                            <label>状态</label>
+                            <select name="status" required>
+                                <option value="active" \${token.status === 'active' ? 'selected' : ''}>活跃</option>
+                                <option value="disabled" \${token.status === 'disabled' ? 'selected' : ''}>禁用</option>
+                                <option value="maintenance" \${token.status === 'maintenance' ? 'selected' : ''}>维护中</option>
+                            </select>
+                        </div>
+                        <button type="submit" class="btn btn-primary">更新Token</button>
+                        <button type="button" onclick="closeModal()" class="btn btn-secondary" style="margin-left: 10px;">取消</button>
+                    </form>
+                \`;
+                showModal(content);
+
+                document.getElementById('editTokenForm').addEventListener('submit', async (e) => {
+                    e.preventDefault();
+                    const formData = new FormData(e.target);
+                    const tokenData = Object.fromEntries(formData);
+
+                    try {
+                        const result = await apiRequest(\`/api/admin/tokens/\${tokenId}\`, {
+                            method: 'PUT',
+                            body: JSON.stringify(tokenData)
+                        });
+
+                        if (result.status === 'success') {
+                            closeModal();
+                            loadTokens();
+                            alert('Token更新成功');
+                        } else {
+                            alert('更新失败: ' + result.error);
+                        }
+                    } catch (error) {
+                        alert('更新失败: ' + error.message);
+                    }
+                });
+
+            } catch (error) {
+                alert('获取Token信息失败: ' + error.message);
+            }
+        }
+
+        // 删除Token
+        async function deleteToken(tokenId) {
+            if (!confirm('确定要删除这个Token吗？删除后将无法恢复！')) {
+                return;
+            }
+
+            try {
+                const result = await apiRequest(\`/api/admin/tokens/\${tokenId}\`, {
+                    method: 'DELETE'
+                });
+
+                if (result.status === 'success') {
+                    loadTokens();
+                    alert('Token删除成功');
+                } else {
+                    alert('删除失败: ' + result.error);
+                }
+            } catch (error) {
+                alert('删除失败: ' + error.message);
             }
         }
 
